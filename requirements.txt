@@ -1,0 +1,125 @@
+import os
+import anthropic
+import chromadb
+import hashlib
+from pathlib import Path
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+# ── Configuración ──────────────────────────────────────────
+API_KEY    = os.environ.get("ANTHROPIC_API_KEY", "TU_API_KEY_AQUI")
+COLECCION  = "aura"
+CARPETA_BD = "data/base_vectorial"
+
+# ── Inicializar ─────────────────────────────────────────────
+Path(CARPETA_BD).mkdir(parents=True, exist_ok=True)
+cliente_ai = anthropic.Anthropic(api_key=API_KEY)
+db         = chromadb.PersistentClient(path=CARPETA_BD)
+coleccion  = db.get_or_create_collection(name=COLECCION)
+
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+historiales: dict[str, list] = {}   # historial por sesión
+
+# ── Helpers ─────────────────────────────────────────────────
+def obtener_embedding(texto: str):
+    h = hashlib.sha256(texto.encode()).hexdigest()
+    return [int(h[i], 16) / 15.0 for i in range(64)]
+
+def dividir_texto(texto: str, tamano=500, solapamiento=50):
+    palabras = texto.split()
+    frags, inicio = [], 0
+    while inicio < len(palabras):
+        frags.append(" ".join(palabras[inicio:inicio+tamano]))
+        inicio += tamano - solapamiento
+    return frags or [texto]
+
+def agregar_informacion(texto: str, etiqueta="memoria"):
+    frags     = dividir_texto(texto)
+    existente = coleccion.get()["ids"]
+    ids, docs, metas, embs = [], [], [], []
+    for i, frag in enumerate(frags):
+        nid = f"{etiqueta}_{i}_{len(existente)+i}"
+        if nid not in existente:
+            ids.append(nid); docs.append(frag)
+            metas.append({"fuente": etiqueta})
+            embs.append(obtener_embedding(frag))
+    if ids:
+        coleccion.add(documents=docs, ids=ids, metadatas=metas, embeddings=embs)
+
+def buscar_contexto(pregunta: str, n=4):
+    total = coleccion.count()
+    if total == 0:
+        return ""
+    res = coleccion.query(
+        query_embeddings=[obtener_embedding(pregunta)],
+        n_results=min(n, total)
+    )
+    return "\n\n".join(res["documents"][0])
+
+# ── Modelos de request ───────────────────────────────────────
+class ChatRequest(BaseModel):
+    session_id: str
+    mensaje: str
+
+class InfoRequest(BaseModel):
+    texto: str
+    etiqueta: str = "dato"
+
+# ── Endpoints ────────────────────────────────────────────────
+@app.get("/")
+def root():
+    return {"status": "Aura está activa ✨"}
+
+@app.post("/chat")
+def chat(req: ChatRequest):
+    historial = historiales.setdefault(req.session_id, [])
+    contexto  = buscar_contexto(req.mensaje)
+
+    sistema = (
+        "Eres Aura, una asistente personal inteligente, cercana y concisa. "
+        "Responde SOLO lo que te preguntan, en español, de forma natural y breve. "
+        "No menciones menús ni opciones.\n\n"
+        + (f"Información que tienes del usuario:\n{contexto}" if contexto
+           else "Aún no tienes información guardada.")
+    )
+
+    historial.append({"role": "user", "content": req.mensaje})
+
+    resp = cliente_ai.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1024,
+        system=sistema,
+        messages=historial
+    )
+
+    texto = resp.content[0].text
+    historial.append({"role": "assistant", "content": texto})
+
+    # guardar conversación automáticamente
+    agregar_informacion(
+        f"Usuario: {req.mensaje}\nAura: {texto}",
+        etiqueta="conversacion"
+    )
+
+    if len(historial) > 20:
+        historial.pop(0); historial.pop(0)
+
+    return {"respuesta": texto}
+
+@app.post("/guardar")
+def guardar(req: InfoRequest):
+    agregar_informacion(req.texto, req.etiqueta)
+    return {"status": "guardado"}
+
+@app.get("/stats")
+def stats():
+    total = coleccion.count()
+    return {"fragmentos": total}
